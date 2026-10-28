@@ -1,0 +1,14 @@
+README.md
+  h_15504845cc6f56 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "38bf12b8d32f82262c2b855320d189805b14bab8",
+  "prompts": {},
+  "humans": {
+    "h_15504845cc6f56": {
+      "author": "sunnylovelife <602546990@qq.com>"
+    }
+  }
+}
