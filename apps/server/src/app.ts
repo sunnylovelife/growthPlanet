@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { enqueueDownload, enqueueTranscode, probeDuration } from "./download.ts";
+import { enqueueDownload, enqueueTranscode, extractCover, jobProgress, probeDuration } from "./download.ts";
 import { HttpError, createService, type Clock, type Service } from "./service.ts";
 
 type Ctx = { params: Record<string, string>; query: Record<string, string>; body: unknown; raw: Buffer; user: ReturnType<Service["publicUser"]> | null };
@@ -168,7 +168,7 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
     } },
     { method: "POST", path: "/api/admin/tasks/:id/skip", role: "parent", handler: async (ctx) => service.skipSwim(mustUser(ctx).id, Number(ctx.params.id)) },
     { method: "POST", path: "/api/admin/tasks/:id/undo", role: "parent", handler: async (ctx) => service.undoTask(mustUser(ctx).id, Number(ctx.params.id)) },
-    { method: "GET", path: "/api/admin/videos", role: "parent", handler: async () => ({ videos: service.listVideos() }) },
+    { method: "GET", path: "/api/admin/videos", role: "parent", handler: async () => ({ videos: service.listVideos().map((video) => ({ ...video, progress: jobProgress(video.id) })) }) },
     { method: "POST", path: "/api/admin/videos", role: "parent", handler: async (ctx) => {
       const created = service.addVideoFromShare(mustUser(ctx).id, String((ctx.body as { shareText?: string }).shareText || ""));
       const row = service.markVideo(created.id, { status: "queued" });
@@ -248,6 +248,14 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
   function cookiesFromCtx(ctx: Ctx) {
     return (ctx as Ctx & { token?: string }).token;
   }
+  async function sendCover(req: IncomingMessage, res: ServerResponse, id: number, requirePublished: boolean) {
+    const source = service.coverSource(id, requirePublished);
+    if (!existsSync(source.cover)) {
+      const ok = await extractCover(source.video, source.cover);
+      if (!ok) throw new HttpError(404, "还没有封面");
+    }
+    return streamFile(req, res, source.cover, "image/jpeg", "private, max-age=86400");
+  }
   const server = createServer(async (req, res) => {
     try {
       const url = req.url || "/";
@@ -255,6 +263,22 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
         const token = new URL(url, "http://local").searchParams.get("t") || undefined;
         const file = service.mediaAuth(token);
         return streamFile(req, res, file, "video/mp4");
+      }
+      if (req.method === "GET" && /^\/api\/admin\/videos\/\d+\/file/.test(url.split("?")[0])) {
+        const user = service.userByToken(cookies(req).gp_session);
+        if (!user || user.role !== "parent") throw new HttpError(403, "只有家长可以看");
+        const id = Number(url.split("/")[4]);
+        return streamFile(req, res, service.parentPreviewFile(id), "video/mp4");
+      }
+      if (req.method === "GET" && /^\/api\/admin\/videos\/\d+\/cover/.test(url.split("?")[0])) {
+        const user = service.userByToken(cookies(req).gp_session);
+        if (!user || user.role !== "parent") throw new HttpError(403, "只有家长可以看");
+        return await sendCover(req, res, Number(url.split("/")[4]), false);
+      }
+      if (req.method === "GET" && /^\/api\/videos\/\d+\/cover/.test(url.split("?")[0])) {
+        const user = service.userByToken(cookies(req).gp_session);
+        if (!user || user.role !== "child") throw new HttpError(403, "请用孩子账号");
+        return await sendCover(req, res, Number(url.split("/")[3]), true);
       }
       if (req.method === "GET" && /^\/api\/admin\/tasks\/\d+\/photo/.test(url.split("?")[0])) {
         const token = cookies(req).gp_session;

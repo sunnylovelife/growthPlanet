@@ -33,6 +33,7 @@ h1 { margin: 0; font-size: 34px; letter-spacing: 0.04em; }
 .balance b { display: block; font-size: 32px; color: var(--gold); }
 .balance.neg b { color: var(--bad); }
 .panel, .task, .video, .outfit { background: var(--card); border: 1px solid var(--line); border-radius: 24px; padding: 16px; margin-top: 14px; }
+img.cover { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 16px; margin-bottom: 10px; display: block; background: #000; }
 .task { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; align-items: center; }
 .task h2, .panel h2 { margin: 0; font-size: 22px; }
 .primary, .ghost {

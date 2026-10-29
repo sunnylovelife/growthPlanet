@@ -1,23 +1,71 @@
 import { spawn } from "node:child_process";
-import { createWriteStream, mkdirSync, renameSync, rmSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { Service } from "./service.ts";
 
 const DESKTOP_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
-function exec(cmd: string, args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
-    child.on("error", (error) => reject(error));
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(stderr.trim().slice(-400) || `${cmd} 退出码 ${code}`));
-    });
+export type JobPhase = "opening" | "downloading" | "transcoding";
+export type JobProgress = { phase: JobPhase; received: number; total: number | null; etaSeconds: number | null; speedBps: number };
+type JobState = { phase: JobPhase; received: number; total: number | null; startedAt: number; etaSeconds?: number | null; speedBps?: number };
+const jobs = new Map<number, JobState>();
+
+export function estimateEta(received: number, total: number | null, startedAt: number, now: number): { etaSeconds: number | null; speedBps: number } {
+  const elapsed = (now - startedAt) / 1000;
+  if (elapsed < 0.8 || received <= 0) return { etaSeconds: null, speedBps: 0 };
+  const speedBps = received / elapsed;
+  if (!total || total <= received) return { etaSeconds: total != null && total <= received ? 0 : null, speedBps };
+  return { etaSeconds: Math.round((total - received) / speedBps), speedBps };
+}
+
+export function jobProgress(videoId: number, now = Date.now()): JobProgress | null {
+  const job = jobs.get(videoId);
+  if (!job) return null;
+  const estimated = job.speedBps == null ? estimateEta(job.received, job.total, job.startedAt, now) : { etaSeconds: job.etaSeconds ?? null, speedBps: job.speedBps };
+  return { phase: job.phase, received: job.received, total: job.total, etaSeconds: estimated.etaSeconds, speedBps: Math.round(estimated.speedBps) };
+}
+
+function setJob(videoId: number, job: JobState) {
+  jobs.set(videoId, job);
+}
+
+function clearJob(videoId: number) {
+  jobs.delete(videoId);
+}
+
+export function parseYtDlpProgress(line: string): { percent: number; totalBytes: number; speedBps: number; etaSeconds: number | null } | null {
+  const matched = /\[download\]\s+([\d.]+)% of\s+~?([\d.]+)\s*(Ki|Mi|Gi)?B at\s+([\d.]+)\s*(Ki|Mi|Gi)?B\/s(?: ETA (\d+):(\d+)(?::(\d+))?)?/.exec(line);
+  if (!matched) return null;
+  const scale = (unit?: string) => unit === "Gi" ? 1024 ** 3 : unit === "Mi" ? 1024 ** 2 : unit === "Ki" ? 1024 : 1;
+  const eta = matched[6] == null ? null : matched[8] != null
+    ? Number(matched[6]) * 3600 + Number(matched[7]) * 60 + Number(matched[8])
+    : Number(matched[6]) * 60 + Number(matched[7]);
+  return { percent: Number(matched[1]), totalBytes: Number(matched[2]) * scale(matched[3]), speedBps: Number(matched[4]) * scale(matched[5]), etaSeconds: eta };
+}
+
+export function parseFfmpegOutTime(line: string): number | null {
+  const matched = /^out_time=(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(line.trim());
+  if (!matched) return null;
+  return Number(matched[1]) * 3600 + Number(matched[2]) * 60 + Number(matched[3]);
+}
+
+function grabFrame(videoFile: string, coverFile: string, at: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn("ffmpeg", ["-y", "-ss", at, "-i", videoFile, "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "3", coverFile], { stdio: "ignore" });
+    const timer = setTimeout(() => { child.kill("SIGKILL"); }, 20000);
+    const done = (ok: boolean) => { clearTimeout(timer); resolve(ok); };
+    child.on("error", () => done(false));
+    child.on("close", (code) => done(code === 0 && existsSync(coverFile) && statSync(coverFile).size > 0));
   });
+}
+
+export async function extractCover(videoFile: string, coverFile: string): Promise<boolean> {
+  mkdirSync(path.dirname(coverFile), { recursive: true });
+  if (await grabFrame(videoFile, coverFile, "1")) return true;
+  rmSync(coverFile, { force: true });
+  return grabFrame(videoFile, coverFile, "0");
 }
 
 export async function probeDuration(file: string): Promise<number> {
@@ -68,16 +116,35 @@ export function needsTranscode(info: ProbeInfo): boolean {
   return Boolean(info.audioCodec && info.audioCodec !== "aac");
 }
 
-async function transcode(file: string) {
+async function transcode(file: string, videoId: number, durationSeconds: number) {
   const tmp = `${file}.transcoding.mp4`;
+  setJob(videoId, { phase: "transcoding", received: 0, total: durationSeconds > 0 ? durationSeconds : null, startedAt: Date.now() });
   try {
-    await exec("ffmpeg", [
-      "-y", "-i", file,
-      "-vf", `scale=w='if(gt(iw,ih),-2,min(${MAX_SHORT_SIDE},iw))':h='if(gt(iw,ih),min(${MAX_SHORT_SIDE},ih),-2)'`,
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-maxrate", "2M", "-bufsize", "4M", "-pix_fmt", "yuv420p",
-      "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-threads", "2",
-      tmp,
-    ]);
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("ffmpeg", [
+        "-y", "-i", file,
+        "-vf", `scale=w='if(gt(iw,ih),-2,min(${MAX_SHORT_SIDE},iw))':h='if(gt(iw,ih),min(${MAX_SHORT_SIDE},ih),-2)'`,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-maxrate", "2M", "-bufsize", "4M", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-threads", "2",
+        "-progress", "pipe:1", "-nostats", tmp,
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+      let buffer = "";
+      child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      child.stdout.on("data", (chunk) => {
+        buffer += String(chunk);
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const seconds = parseFfmpegOutTime(line);
+          if (seconds == null) continue;
+          const current = jobs.get(videoId);
+          setJob(videoId, { phase: "transcoding", received: seconds, total: durationSeconds > 0 ? durationSeconds : null, startedAt: current?.startedAt ?? Date.now() });
+        }
+      });
+      child.on("error", (error) => reject(error));
+      child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr.trim().slice(-400) || `ffmpeg 退出码 ${code}`)));
+    });
     renameSync(tmp, file);
   } finally {
     rmSync(tmp, { force: true });
@@ -85,19 +152,24 @@ async function transcode(file: string) {
 }
 
 async function finalizeVideo(service: Service, videoId: number, file: string) {
-  service.markVideo(videoId, { status: "processing", error: null });
-  const info = await probeMedia(file);
-  let note: string | null = null;
-  if (info && needsTranscode(info)) {
-    try {
-      await transcode(file);
-    } catch (error) {
-      note = `转码失败，先用原文件：${(error instanceof Error ? error.message : String(error)).split("\n")[0].slice(0, 120)}`;
+  try {
+    service.markVideo(videoId, { status: "processing", error: null });
+    const info = await probeMedia(file);
+    let note: string | null = null;
+    if (info && needsTranscode(info)) {
+      try {
+        await transcode(file, videoId, await probeDuration(file));
+      } catch (error) {
+        note = `转码失败，先用原文件：${(error instanceof Error ? error.message : String(error)).split("\n")[0].slice(0, 120)}`;
+      }
     }
+    const durationSeconds = await probeDuration(file);
+    service.markVideo(videoId, { filePath: file, durationSeconds, status: "ready" });
+    if (note) service.markVideo(videoId, { status: "ready", error: note });
+    await extractCover(file, path.join(path.dirname(file), "..", "covers", `${videoId}.jpg`));
+  } finally {
+    clearJob(videoId);
   }
-  const durationSeconds = await probeDuration(file);
-  service.markVideo(videoId, { filePath: file, durationSeconds, status: "ready" });
-  if (note) service.markVideo(videoId, { status: "ready", error: note });
 }
 
 type PlayAddr = { url_list?: string[]; width?: number; height?: number };
@@ -128,7 +200,8 @@ async function fetchDouyinDetail(url: string): Promise<{ desc?: string; video: D
   }
 }
 
-async function downloadViaBrowser(url: string, out: string) {
+async function downloadViaBrowser(url: string, out: string, videoId: number) {
+  setJob(videoId, { phase: "opening", received: 0, total: null, startedAt: Date.now() });
   const detail = await fetchDouyinDetail(url);
   const urls = pickPlayUrls(detail.video);
   if (!urls.length) throw new Error("抖音视频信息里没有播放地址");
@@ -137,7 +210,18 @@ async function downloadViaBrowser(url: string, out: string) {
     try {
       const res = await fetch(playUrl, { headers: { "user-agent": DESKTOP_UA, referer: "https://www.douyin.com/" } });
       if (!res.ok || !res.body) throw new Error(`视频地址返回 ${res.status}`);
-      await pipeline(Readable.fromWeb(res.body as import("node:stream/web").ReadableStream), createWriteStream(out));
+      const total = Number(res.headers.get("content-length")) || null;
+      let received = 0;
+      const startedAt = Date.now();
+      setJob(videoId, { phase: "downloading", received: 0, total, startedAt });
+      const counter = new Transform({
+        transform(chunk, _encoding, callback) {
+          received += chunk.length;
+          setJob(videoId, { phase: "downloading", received, total, startedAt });
+          callback(null, chunk);
+        },
+      });
+      await pipeline(Readable.fromWeb(res.body as import("node:stream/web").ReadableStream), counter, createWriteStream(out));
       return;
     } catch (error) {
       lastError = error;
@@ -145,6 +229,35 @@ async function downloadViaBrowser(url: string, out: string) {
     }
   }
   throw lastError;
+}
+
+function runYtDlp(url: string, out: string, videoId: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("yt-dlp", ["-o", out, "--no-playlist", "--merge-output-format", "mp4", "--newline", url], { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    let buffer = "";
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.stdout.on("data", (chunk) => {
+      buffer += String(chunk);
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const parsed = parseYtDlpProgress(line);
+        if (!parsed) continue;
+        const current = jobs.get(videoId);
+        setJob(videoId, {
+          phase: "downloading",
+          received: Math.round(parsed.totalBytes * parsed.percent / 100),
+          total: Math.round(parsed.totalBytes),
+          startedAt: current?.startedAt ?? Date.now(),
+          etaSeconds: parsed.etaSeconds,
+          speedBps: parsed.speedBps,
+        });
+      }
+    });
+    child.on("error", (error) => reject(error));
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr.trim().slice(-400) || `yt-dlp 退出码 ${code}`)));
+  });
 }
 
 let chain: Promise<void> = Promise.resolve();
@@ -170,8 +283,8 @@ async function downloadOne(service: Service, videoId: number, url: string, dataD
   service.markVideo(videoId, { status: "downloading", error: null });
   const errors: string[] = [];
   for (const [name, attempt] of [
-    ["浏览器", () => downloadViaBrowser(url, out)],
-    ["yt-dlp", () => exec("yt-dlp", ["-o", out, "--no-playlist", "--merge-output-format", "mp4", url])],
+    ["浏览器", () => downloadViaBrowser(url, out, videoId)],
+    ["yt-dlp", () => runYtDlp(url, out, videoId)],
   ] as const) {
     try {
       await attempt();
@@ -183,5 +296,6 @@ async function downloadOne(service: Service, videoId: number, url: string, dataD
     await finalizeVideo(service, videoId, out);
     return;
   }
+  clearJob(videoId);
   service.markVideo(videoId, { status: "failed", error: `下载失败，请从相册上传。${errors.join("；")}` });
 }

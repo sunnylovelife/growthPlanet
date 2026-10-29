@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -318,9 +319,43 @@ test("相册上传合并后删除分片，删除视频时文件一起删掉", as
     assert.ok(existsSync(file));
     assert.equal((await fetch(`${base}/api/admin/videos/${saved.id}`, { method: "PATCH", headers, body: JSON.stringify({ filePath: "/etc/passwd" }) })).status, 200);
     assert.equal((service.markVideo(saved.id, {}) as { file_path: string }).file_path, file, "不能通过接口改文件路径");
+    const preview = await fetch(`${base}/api/admin/videos/${saved.id}/file`, { headers: { cookie: parent.cookie } });
+    assert.equal(preview.status, 200);
+    assert.equal(preview.headers.get("content-type"), "video/mp4");
+    const kid = await login(base, "boy", "kid");
+    assert.equal((await fetch(`${base}/api/admin/videos/${saved.id}/file`, { headers: { cookie: kid.cookie } })).status, 403);
     await fetch(`${base}/api/admin/videos/${saved.id}`, { method: "DELETE", headers });
     assert.equal(existsSync(file), false, "视频文件应被删除");
   } finally {
+    server.close();
+  }
+});
+
+test("已上架的视频能截出封面，没上架时孩子看不到", async () => {
+  const { server, service, dataDir } = boot();
+  const base = await listen(server);
+  try {
+    const file = path.join(dataDir, "videos", "clip.mp4");
+    mkdirSync(path.dirname(file), { recursive: true });
+    const made = spawnSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=red:s=320x180:d=1", "-pix_fmt", "yuv420p", file], { stdio: "ignore" });
+    if (made.status !== 0) return;
+    const parentId = service.users().find((user) => user.username === "parent")!.id as number;
+    const saved = service.saveUpload(parentId, "片段.mp4", file, 1);
+    const parent = await login(base, "parent", "admin");
+    const cover = await fetch(`${base}/api/admin/videos/${saved.id}/cover`, { headers: { cookie: parent.cookie } });
+    assert.equal(cover.status, 200);
+    assert.equal(cover.headers.get("content-type"), "image/jpeg");
+    assert.ok((await cover.arrayBuffer()).byteLength > 100);
+    const kid = await login(base, "boy", "kid");
+    const hidden = await fetch(`${base}/api/videos/${saved.id}/cover`, { headers: { cookie: kid.cookie } });
+    assert.equal(hidden.status, 404);
+    await hidden.arrayBuffer();
+    service.markVideo(saved.id, { published: true });
+    const shown = await fetch(`${base}/api/videos/${saved.id}/cover`, { headers: { cookie: kid.cookie } });
+    assert.equal(shown.status, 200);
+    await shown.arrayBuffer();
+  } finally {
+    server.closeAllConnections();
     server.close();
   }
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { needsTranscode, pickPlayUrls, type ProbeInfo } from "../src/download.ts";
+import { estimateEta, needsTranscode, parseFfmpegOutTime, parseYtDlpProgress, pickPlayUrls, type ProbeInfo } from "../src/download.ts";
 
 const ipadFriendly: ProbeInfo = { formatName: "mov,mp4,m4a,3gp,3g2,mj2", bitRate: 1_500_000, video: { codec: "h264", width: 1280, height: 720, pixFmt: "yuv420p" }, audioCodec: "aac" };
 
@@ -14,6 +14,24 @@ test("720p 以内的 H.264/AAC MP4 不转码，其他情况都转码", () => {
   assert.equal(needsTranscode({ ...ipadFriendly, audioCodec: "opus" }), true, "音频不是 AAC");
   assert.equal(needsTranscode({ ...ipadFriendly, audioCodec: undefined }), false, "没有音轨");
   assert.equal(needsTranscode({ formatName: "mp4", bitRate: 0 }), false, "没有视频流的文件交给播放端报错");
+});
+
+test("下载进度能算出剩余时间，刚开始的不到 1 秒不估算", () => {
+  assert.deepEqual(estimateEta(5 * 1024 * 1024, 20 * 1024 * 1024, 1_000, 11_000), { etaSeconds: 30, speedBps: (5 * 1024 * 1024) / 10 });
+  assert.equal(estimateEta(1000, 9000, 1_000, 1_200).etaSeconds, null);
+  assert.equal(estimateEta(1000, null, 1_000, 5_000).etaSeconds, null);
+});
+
+test("能从 yt-dlp 和 ffmpeg 的输出里读出进度", () => {
+  const parsed = parseYtDlpProgress("[download]  25.0% of 8.00MiB at 2.00MiB/s ETA 00:03");
+  assert.equal(parsed?.percent, 25);
+  assert.equal(parsed?.totalBytes, 8 * 1024 * 1024);
+  assert.equal(parsed?.speedBps, 2 * 1024 * 1024);
+  assert.equal(parsed?.etaSeconds, 3);
+  assert.equal(parseYtDlpProgress("[download]  10.0% of 1.50GiB at 500.00KiB/s ETA 01:02:03")?.etaSeconds, 3723);
+  assert.equal(parseYtDlpProgress("not progress"), null);
+  assert.equal(parseFfmpegOutTime("out_time=00:01:30.50"), 90.5);
+  assert.equal(parseFfmpegOutTime("progress=continue"), null);
 });
 
 test("抖音视频优先选不超过 720p 的最高码率 H.264", () => {

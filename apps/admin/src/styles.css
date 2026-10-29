@@ -22,5 +22,8 @@ textarea { min-height: 96px; }
 .muted { color: #b7c3d4; }
 .error { color: #ff8b7b; }
 .ok { color: #8ddeaf; }
-img.photo { width: 100%; border-radius: 12px; margin-top: 8px; }
+.bar { height: 8px; background: #0e2238; border-radius: 99px; overflow: hidden; margin-top: 8px; }
+.bar span { display: block; height: 100%; background: #f5c16c; }
+img.photo, video.preview { width: 100%; border-radius: 12px; margin-top: 8px; background: #000; }
+img.cover { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 14px; margin-bottom: 10px; display: block; background: #0e2238; }
 .tabs button.on { background: #f5c16c; color: #3a2500; }

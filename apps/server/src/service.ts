@@ -629,6 +629,23 @@ export function createService(db: DatabaseSync, clock: Clock, dataDir: string) {
       logEvent(childId, "video_end", { watchId, reason, seconds });
       return { ok: true };
     },
+    coverSource(id: number, requirePublished: boolean) {
+      const video = one<{ file_path: string | null; status: string; published: number }>(db, "SELECT file_path, status, published FROM video WHERE id = ?", id);
+      if (!video || video.status !== "ready" || !video.file_path) throw new HttpError(404, "还没有封面");
+      if (requirePublished && !video.published) throw new HttpError(404, "还没有封面");
+      const videosDir = path.resolve(dataDir, "videos") + path.sep;
+      const file = path.resolve(video.file_path);
+      if (!file.startsWith(videosDir)) throw new HttpError(404, "还没有封面");
+      return { video: file, cover: path.join(dataDir, "covers", `${id}.jpg`) };
+    },
+    parentPreviewFile(id: number) {
+      const video = one<{ file_path: string | null; status: string }>(db, "SELECT file_path, status FROM video WHERE id = ?", id);
+      if (!video || video.status !== "ready" || !video.file_path) throw new HttpError(404, "视频还不能播放");
+      const videosDir = path.resolve(dataDir, "videos") + path.sep;
+      const file = path.resolve(video.file_path);
+      if (!file.startsWith(videosDir)) throw new HttpError(404, "视频文件不存在");
+      return file;
+    },
     mediaAuth(token: string | undefined) {
       if (!token) throw new HttpError(401, "不能直接打开视频");
       const watch = one<{ video_id: number; token_expires_at: string; ended_at: string | null }>(db, "SELECT * FROM video_watch WHERE token = ?", token);
@@ -666,6 +683,7 @@ export function createService(db: DatabaseSync, clock: Clock, dataDir: string) {
       run(db, "DELETE FROM video WHERE id = ?", id);
       const videosDir = path.resolve(dataDir, "videos") + path.sep;
       if (video?.file_path && path.resolve(video.file_path).startsWith(videosDir)) rmSync(video.file_path, { force: true });
+      rmSync(path.join(dataDir, "covers", `${id}.jpg`), { force: true });
       logAction(parentId, "delete_video", "video", String(id), {});
     },
     unfinishedVideos() {

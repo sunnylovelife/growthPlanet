@@ -29,6 +29,7 @@ const VIDEO_STATUS: Record<string, string> = {
   failed: "失败",
 };
 
+interface VideoProgress { phase: "opening" | "downloading" | "transcoding"; received: number; total: number | null; etaSeconds: number | null; speedBps: number }
 interface VideoRow {
   id: number;
   title: string;
@@ -37,6 +38,41 @@ interface VideoRow {
   published: number;
   duration_seconds: number;
   source_url: string | null;
+  progress?: VideoProgress | null;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function etaText(seconds: number | null): string {
+  if (seconds == null) return "正在估算剩余时间";
+  if (seconds < 5) return "快好了";
+  if (seconds < 60) return `大约还要 ${Math.round(seconds)} 秒`;
+  const minutes = Math.ceil(seconds / 60);
+  return minutes < 60 ? `大约还要 ${minutes} 分钟` : `大约还要 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
+}
+
+function progressLine(video: VideoRow): { text: string; percent: number | null } | null {
+  const job = video.progress;
+  if (video.status === "queued" && !job) return { text: "排队中，开始后会显示进度和剩余时间", percent: null };
+  if (!job) return null;
+  if (job.phase === "opening") return { text: "正在打开抖音页面，这一步大约 10–20 秒", percent: null };
+  if (job.phase === "downloading") {
+    if (job.total) {
+      const percent = Math.min(100, Math.round(job.received / job.total * 100));
+      return { text: `下载 ${percent}% · ${formatBytes(job.received)} / ${formatBytes(job.total)} · ${etaText(job.etaSeconds)}`, percent };
+    }
+    const speed = job.speedBps > 0 ? ` · ${formatBytes(job.speedBps)}/秒` : "";
+    return { text: `已下载 ${formatBytes(job.received)}${speed}，总大小未知`, percent: null };
+  }
+  if (job.total && job.total > 0) {
+    const percent = Math.min(99, Math.round(job.received / job.total * 100));
+    return { text: `转码 ${percent}% · ${etaText(job.etaSeconds)}`, percent };
+  }
+  return { text: "正在转码，这一步按视频长度大约要几分钟", percent: null };
 }
 interface UserRow { id: number; username: string; role: string; displayRole: string; status: string; nickname?: string }
 
@@ -48,6 +84,7 @@ export function App() {
   const [approvals, setApprovals] = useState<(Task & { child: { nickname: string } })[]>([]);
   const [videos, setVideos] = useState<VideoRow[]>([]);
   const [share, setShare] = useState("");
+  const [playingId, setPlayingId] = useState<number | null>(null);
   const [progress, setProgress] = useState("");
   const [bookChild, setBookChild] = useState<number | null>(null);
   const [entries, setEntries] = useState<{ title: string; amount: number; balanceAfter: number; createdAt: string }[]>([]);
@@ -67,6 +104,15 @@ export function App() {
     for (const child of data.children) for (const task of child.tasks) if (task.deadlineAt) next[task.id] = task.deadlineAt.slice(0, 16);
     setDeadlines(next);
   }
+
+  const videoBusy = videos.some((video) => video.status === "queued" || video.status === "downloading" || video.status === "processing");
+  useEffect(() => {
+    if (!authed || tab !== "video" || !videoBusy) return;
+    const timer = window.setInterval(() => {
+      void api<{ videos: VideoRow[] }>("/api/admin/videos").then((res) => setVideos(res.videos)).catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [authed, tab, videoBusy]);
 
   useEffect(() => {
     api<{ user: { role: string } }>("/api/auth/me").then((res) => {
@@ -191,19 +237,30 @@ export function App() {
             <input type="file" accept="video/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file).catch((err) => setError(err.message)); }} />
             {progress && <p className="ok">{progress}</p>}
           </section>
-          {videos.map((video) => (
+          {videos.map((video) => {
+            const line = progressLine(video);
+            return (
             <article className="card" key={video.id}>
+              {video.status === "ready" && <img className="cover" src={`/api/admin/videos/${video.id}/cover`} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }} />}
               <h2>{video.title}</h2>
               <p className="muted">{VIDEO_STATUS[video.status] ?? video.status} · {video.duration_seconds} 秒 {video.published ? "· 已上架" : "· 未上架"}</p>
+              {line && (
+                <>
+                  <p className="ok">{line.text}</p>
+                  {line.percent != null && <div className="bar"><span style={{ width: `${line.percent}%` }} /></div>}
+                </>
+              )}
               {video.error && <p className="error">{video.error}</p>}
+              {playingId === video.id && <video className="preview" src={`/api/admin/videos/${video.id}/file`} controls playsInline autoPlay />}
               <div className="row">
-                <button className="primary" onClick={() => api(`/api/admin/videos/${video.id}`, { method: "PATCH", body: JSON.stringify({ published: !video.published }) }).then(() => api<{ videos: VideoRow[] }>("/api/admin/videos")).then((res) => setVideos(res.videos))}>{video.published ? "下架" : "上架"}</button>
+                {video.status === "ready" && <button className="primary" onClick={() => setPlayingId(playingId === video.id ? null : video.id)}>{playingId === video.id ? "收起" : "播放"}</button>}
+                <button className="ghost" onClick={() => api(`/api/admin/videos/${video.id}`, { method: "PATCH", body: JSON.stringify({ published: !video.published }) }).then(() => api<{ videos: VideoRow[] }>("/api/admin/videos")).then((res) => setVideos(res.videos))}>{video.published ? "下架" : "上架"}</button>
                 {video.source_url && <button className="ghost" onClick={() => api(`/api/admin/videos/${video.id}/retry`, { method: "POST", body: "{}" })}>重试下载</button>}
                 <button className="danger" onClick={() => api(`/api/admin/videos/${video.id}`, { method: "DELETE" }).then(() => setVideos(videos.filter((item) => item.id !== video.id)))}>删除</button>
               </div>
-              <input inputMode="numeric" defaultValue={video.duration_seconds} placeholder="时长（秒）" onBlur={(event) => api(`/api/admin/videos/${video.id}`, { method: "PATCH", body: JSON.stringify({ durationSeconds: Number(event.target.value) }) })} />
             </article>
-          ))}
+            );
+          })}
           {videos.length === 0 && <button className="ghost" onClick={() => api<{ videos: VideoRow[] }>("/api/admin/videos").then((res) => setVideos(res.videos))}>刷新视频</button>}
         </>
       )}

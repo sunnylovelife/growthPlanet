@@ -16,7 +16,7 @@ interface Task {
   periodEnd: string;
 }
 interface Home {
-  user: { id: number; nickname: string; outfitId: string; balance: number; displayRole: string };
+  user: { id: number; nickname: string; outfitId: string; balance: number; displayRole: string; role: string };
   date: string;
   tasks: Task[];
   vocab: { name: string; hint: string };
@@ -238,6 +238,7 @@ export function App() {
           {videos.length === 0 && <p className="muted">家长还没有放上新视频。</p>}
           {videos.map((video) => (
             <article className="video" key={video.id}>
+              <img className="cover" src={`/api/videos/${video.id}/cover`} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }} />
               <h2>{video.title}</h2>
               <p className="muted">{Math.ceil(video.duration_seconds / 60) || "不到 1"} 分钟 · {video.quote.freeReplay ? "可以再看一遍" : `今天第 ${video.quote.dailyIndex} 个 · ${video.quote.price} 星币`}</p>
               <button className="primary" onClick={() => buy(video).catch((err) => setError(err.message))}>看这个</button>
