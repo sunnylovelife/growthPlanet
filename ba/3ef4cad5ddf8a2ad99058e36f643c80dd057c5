@@ -1,0 +1,21 @@
+apps/server/package.json
+  s_5e620a46d25acf::t_242af120def531 1-8
+pnpm-lock.yaml
+  s_5e620a46d25acf::t_3618b71dbdb6cc 1-1187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ba3ef4cad5ddf8a2ad99058e36f643c80dd057c5",
+  "prompts": {},
+  "sessions": {
+    "s_5e620a46d25acf": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "df0c6782-1dff-4f88-b109-b5eba2ab8f3a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "sunnylovelife <602546990@qq.com>"
+    }
+  }
+}
