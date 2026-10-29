@@ -1,19 +1,21 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { buildApp } from "../src/app.ts";
-import { migrate, openDatabase } from "../src/db.ts";
+import { MIGRATIONS, migrate, openDatabase } from "../src/db.ts";
+import { idle } from "../src/download.ts";
 
-function boot(start = "2026-10-28T02:00:00.000Z") {
+function boot(start = "2026-10-28T02:00:00.000Z", webRoot?: string) {
   const clock = { current: new Date(start), now() { return this.current; } };
   const db = openDatabase(":memory:");
   migrate(db);
   const dataDir = mkdtempSync(path.join(tmpdir(), "gp-"));
-  const built = buildApp({ db, clock, dataDir });
-  built.service.seed();
+  const built = buildApp({ db, clock, dataDir, webRoot });
+  built.service.seed("123456");
   built.service.ensureCurrentWeeks();
   return { ...built, clock, dataDir };
 }
@@ -24,11 +26,11 @@ async function listen(server: ReturnType<typeof boot>["server"]) {
   return `http://127.0.0.1:${address.port}`;
 }
 
-async function login(base: string, username: string, portal: "kid" | "admin") {
+async function login(base: string, username: string, portal: "kid" | "admin", opts: { password?: string; ip?: string } = {}) {
   const res = await fetch(`${base}/api/auth/login`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username, password: "123456", portal }),
+    headers: { "content-type": "application/json", ...(opts.ip ? { "x-forwarded-for": opts.ip } : {}) },
+    body: JSON.stringify({ username, password: opts.password ?? "123456", portal }),
   });
   const setCookie = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [res.headers.get("set-cookie") || ""];
   return { status: res.status, body: await res.json(), cookie: String(setCookie[0] || "").split(";")[0] };
@@ -222,4 +224,110 @@ test("一周全部达标时，完成最后一个任务的奖励抽 2 张卡", as
   service.runJobs();
   const draws = service.kidHome(boyId).unclaimed.map((item) => item.cardDraws);
   assert.ok(draws.includes(2), `应有一次抽 2 张，实际 ${draws.join(",")}`);
+});
+
+function rawGet(base: string, rawPath: string): Promise<{ status: number; body: string }> {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    request({ hostname, port, path: rawPath, method: "GET" }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += String(chunk); });
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+    }).on("error", reject).end();
+  });
+}
+
+test("静态页面不能用 ../ 读到网站目录以外的文件", async () => {
+  const webRoot = mkdtempSync(path.join(tmpdir(), "gp-web-"));
+  for (const app of ["kid", "admin"]) {
+    mkdirSync(path.join(webRoot, "apps", app, "dist"), { recursive: true });
+    writeFileSync(path.join(webRoot, "apps", app, "dist", "index.html"), `${app}-index`);
+  }
+  mkdirSync(path.join(webRoot, "apps", "kid", "dist-secret"));
+  writeFileSync(path.join(webRoot, "apps", "kid", "dist-secret", "x.txt"), "SECRET");
+  writeFileSync(path.join(webRoot, "secret.txt"), "SECRET");
+  const { server } = boot(undefined, webRoot);
+  const base = await listen(server);
+  try {
+    for (const attack of ["/admin/../../../secret.txt", "/admin/..%2f..%2f..%2fsecret.txt", "/../../secret.txt", "/../dist-secret/x.txt"]) {
+      const res = await rawGet(base, attack);
+      assert.ok(!res.body.includes("SECRET"), `${attack} 泄露了文件`);
+    }
+    assert.equal((await rawGet(base, "/admin/")).body, "admin-index");
+    assert.equal((await rawGet(base, "/")).body, "kid-index");
+  } finally {
+    server.close();
+  }
+});
+
+test("未登录的大请求直接拒绝，不读进内存", async () => {
+  const { server } = boot();
+  const base = await listen(server);
+  try {
+    const res = await fetch(`${base}/api/auth/login`, { method: "POST", headers: { "content-type": "application/json" }, body: "x".repeat(200 * 1024) });
+    assert.equal(res.status, 413);
+  } finally {
+    server.close();
+  }
+});
+
+test("外人猜错密码只锁自己的 IP，家里的 iPad 照常登录", async () => {
+  const { server } = boot();
+  const base = await listen(server);
+  try {
+    for (let i = 0; i < 5; i++) assert.equal((await login(base, "boy", "kid", { password: "wrong", ip: "203.0.113.9" })).status, 401);
+    assert.equal((await login(base, "boy", "kid", { ip: "203.0.113.9" })).status, 423, "攻击者 IP 上该账号被锁");
+    assert.equal((await login(base, "boy", "kid", { ip: "198.51.100.7" })).status, 200, "家里 IP 不受影响");
+
+    for (let i = 0; i < 20; i++) await login(base, `nobody${i}`, "kid", { password: "wrong", ip: "203.0.113.10" });
+    assert.equal((await login(base, "girl", "kid", { ip: "203.0.113.10" })).status, 429, "同一 IP 失败太多次整体限流");
+  } finally {
+    server.close();
+  }
+});
+
+test("首次启动不再使用固定密码", () => {
+  const db = openDatabase(":memory:");
+  migrate(db);
+  const { service } = buildApp({ db, clock: { now: () => new Date() }, dataDir: mkdtempSync(path.join(tmpdir(), "gp-")) });
+  const created = service.seed()!;
+  assert.equal(created.length, 3);
+  assert.ok(created.every((item) => item.password.length >= 8 && item.password !== "123456"));
+  assert.equal(new Set(created.map((item) => item.password)).size, 3);
+  assert.equal(service.seed(), null, "已有账号时不再生成");
+});
+
+test("相册上传合并后删除分片，删除视频时文件一起删掉", async () => {
+  const { server, service, dataDir } = boot();
+  const base = await listen(server);
+  try {
+    const parent = await login(base, "parent", "admin");
+    const headers = { cookie: parent.cookie, "content-type": "application/json" };
+    const created = await (await fetch(`${base}/api/admin/uploads`, { method: "POST", headers, body: JSON.stringify({ filename: "相册.mp4", parts: 2 }) })).json() as { id: string };
+    const chunkDir = path.join(dataDir, "uploads", created.id);
+    assert.equal((await fetch(`${base}/api/admin/uploads/${created.id}/chunks/5`, { method: "PUT", headers: { cookie: parent.cookie }, body: "x" })).status, 400, "超出分片数");
+    assert.equal((await fetch(`${base}/api/admin/uploads/${created.id}/finish`, { method: "POST", headers, body: "{}" })).status, 400, "分片没传完");
+    for (const n of [0, 1]) await fetch(`${base}/api/admin/uploads/${created.id}/chunks/${n}`, { method: "PUT", headers: { cookie: parent.cookie }, body: `part${n}` });
+    assert.ok(existsSync(chunkDir));
+    const saved = await (await fetch(`${base}/api/admin/uploads/${created.id}/finish`, { method: "POST", headers, body: "{}" })).json() as { id: number };
+    assert.equal(existsSync(chunkDir), false, "分片目录应被删除");
+    await idle();
+    const video = service.listVideos().find((row) => row.id === saved.id) as { status: string } & Record<string, unknown>;
+    assert.equal(video.status, "ready");
+    const file = (service.markVideo(saved.id, {}) as { file_path: string }).file_path;
+    assert.ok(existsSync(file));
+    assert.equal((await fetch(`${base}/api/admin/videos/${saved.id}`, { method: "PATCH", headers, body: JSON.stringify({ filePath: "/etc/passwd" }) })).status, 200);
+    assert.equal((service.markVideo(saved.id, {}) as { file_path: string }).file_path, file, "不能通过接口改文件路径");
+    await fetch(`${base}/api/admin/videos/${saved.id}`, { method: "DELETE", headers });
+    assert.equal(existsSync(file), false, "视频文件应被删除");
+  } finally {
+    server.close();
+  }
+});
+
+test("表结构迁移按版本只执行一次", () => {
+  const db = openDatabase(":memory:");
+  migrate(db);
+  migrate(db);
+  assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, MIGRATIONS.length);
 });

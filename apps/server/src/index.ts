@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { migrate, openDatabase } from "./db.ts";
 import { buildApp } from "./app.ts";
+import { enqueueDownload, enqueueTranscode } from "./download.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const dataDir = path.join(root, "data");
@@ -11,7 +12,16 @@ mkdirSync(dataDir, { recursive: true });
 const db = openDatabase(path.join(dataDir, "growth.sqlite"));
 migrate(db);
 const { server, service } = buildApp({ db, clock: { now: () => new Date() }, dataDir, webRoot: root });
-service.seed();
+const created = service.seed(process.env.GP_INIT_PASSWORD);
+if (created) {
+  console.log("已创建初始账号（只显示这一次，请登录家长后台后立即修改密码）：");
+  for (const item of created) console.log(`  ${item.username} / ${item.password}`);
+}
+for (const video of service.unfinishedVideos()) {
+  if (video.status === "processing" && video.file_path) enqueueTranscode(service, video.id, video.file_path);
+  else if (video.source_url) enqueueDownload(service, video.id, video.source_url, dataDir);
+  else service.markVideo(video.id, { status: "failed", error: "服务重启时中断了，请重新上传" });
+}
 const demoDir = path.join(dataDir, "videos");
 mkdirSync(demoDir, { recursive: true });
 if (service.listVideos().length === 0) {
@@ -35,5 +45,4 @@ const host = process.env.HOST || "0.0.0.0";
 server.listen(port, host, () => {
   console.log(`成长星球已启动 http://localhost:${port}`);
   console.log("孩子端开发地址 http://localhost:5173    家长后台 http://localhost:5174");
-  console.log("初始账号  家长 parent / 123456    儿子 boy / 123456    女儿 girl / 123456");
 });

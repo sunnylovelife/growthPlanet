@@ -187,6 +187,26 @@ export function migrate(db: DatabaseSync): void {
       created_at TEXT NOT NULL
     );
   `);
+  const current = Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+  for (let version = current; version < MIGRATIONS.length; version++) {
+    tx(db, () => {
+      MIGRATIONS[version](db);
+      db.exec(`PRAGMA user_version = ${version + 1}`);
+    });
+  }
+}
+
+// 表结构变更只能追加到末尾；已上线的条目不要修改或删除
+export const MIGRATIONS: ((db: DatabaseSync) => void)[] = [
+  (db) => {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_event_log_user_ts ON event_log(user_id, server_ts)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_login_log_created ON login_log(created_at)");
+  },
+];
+
+export function addColumn(db: DatabaseSync, table: string, column: string, ddl: string): void {
+  const exists = many<{ name: string }>(db, `PRAGMA table_info(${table})`).some((col) => col.name === column);
+  if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
 }
 
 export function one<T>(db: DatabaseSync, sql: string, ...params: unknown[]): T | undefined {

@@ -178,7 +178,6 @@ export function App() {
           <input name="password" placeholder="密码" type="password" />
           {error && <p className="error">{error}</p>}
           <button className="primary" type="submit">进入我的星球</button>
-          <p className="muted">初始账号：儿子 boy / 123456，女儿 girl / 123456</p>
         </form>
       </div>
     );

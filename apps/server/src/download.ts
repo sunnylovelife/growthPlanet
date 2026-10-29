@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createWriteStream, mkdirSync, rmSync } from "node:fs";
+import { createWriteStream, mkdirSync, renameSync, rmSync } from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -28,6 +28,76 @@ export async function probeDuration(file: string): Promise<number> {
     child.on("error", () => resolve(0));
     child.on("close", () => resolve(Math.round(Number(out) || 0)));
   });
+}
+
+export type ProbeInfo = { formatName: string; bitRate: number; video?: { codec: string; width: number; height: number; pixFmt: string }; audioCodec?: string };
+
+export async function probeMedia(file: string): Promise<ProbeInfo | null> {
+  return new Promise((resolve) => {
+    const child = spawn("ffprobe", ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", file], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    child.stdout.on("data", (chunk) => { out += String(chunk); });
+    child.on("error", () => resolve(null));
+    child.on("close", () => {
+      try {
+        const data = JSON.parse(out) as { format?: { format_name?: string; bit_rate?: string }; streams?: { codec_type?: string; codec_name?: string; width?: number; height?: number; pix_fmt?: string }[] };
+        const video = data.streams?.find((s) => s.codec_type === "video");
+        const audio = data.streams?.find((s) => s.codec_type === "audio");
+        resolve({
+          formatName: data.format?.format_name ?? "",
+          bitRate: Number(data.format?.bit_rate) || 0,
+          video: video ? { codec: video.codec_name ?? "", width: video.width ?? 0, height: video.height ?? 0, pixFmt: video.pix_fmt ?? "" } : undefined,
+          audioCodec: audio?.codec_name,
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+const MAX_SHORT_SIDE = 720;
+const MAX_BIT_RATE = 3_000_000;
+
+export function needsTranscode(info: ProbeInfo): boolean {
+  if (!info.video) return false;
+  if (!info.formatName.includes("mp4")) return true;
+  if (info.video.codec !== "h264" || info.video.pixFmt !== "yuv420p") return true;
+  if (Math.min(info.video.width, info.video.height) > MAX_SHORT_SIDE) return true;
+  if (info.bitRate > MAX_BIT_RATE) return true;
+  return Boolean(info.audioCodec && info.audioCodec !== "aac");
+}
+
+async function transcode(file: string) {
+  const tmp = `${file}.transcoding.mp4`;
+  try {
+    await exec("ffmpeg", [
+      "-y", "-i", file,
+      "-vf", `scale=w='if(gt(iw,ih),-2,min(${MAX_SHORT_SIDE},iw))':h='if(gt(iw,ih),min(${MAX_SHORT_SIDE},ih),-2)'`,
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-maxrate", "2M", "-bufsize", "4M", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-threads", "2",
+      tmp,
+    ]);
+    renameSync(tmp, file);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+async function finalizeVideo(service: Service, videoId: number, file: string) {
+  service.markVideo(videoId, { status: "processing", error: null });
+  const info = await probeMedia(file);
+  let note: string | null = null;
+  if (info && needsTranscode(info)) {
+    try {
+      await transcode(file);
+    } catch (error) {
+      note = `转码失败，先用原文件：${(error instanceof Error ? error.message : String(error)).split("\n")[0].slice(0, 120)}`;
+    }
+  }
+  const durationSeconds = await probeDuration(file);
+  service.markVideo(videoId, { filePath: file, durationSeconds, status: "ready" });
+  if (note) service.markVideo(videoId, { status: "ready", error: note });
 }
 
 type PlayAddr = { url_list?: string[]; width?: number; height?: number };
@@ -83,6 +153,16 @@ export function enqueueDownload(service: Service, videoId: number, url: string, 
   chain = chain.then(() => downloadOne(service, videoId, url, dataDir)).catch(() => undefined);
 }
 
+export function enqueueTranscode(service: Service, videoId: number, file: string) {
+  chain = chain.then(() => finalizeVideo(service, videoId, file)).catch((error) => {
+    try { service.markVideo(videoId, { status: "failed", error: `处理失败：${error instanceof Error ? error.message : String(error)}` }); } catch { /* 视频已被删除 */ }
+  });
+}
+
+export function idle(): Promise<void> {
+  return chain;
+}
+
 async function downloadOne(service: Service, videoId: number, url: string, dataDir: string) {
   const dir = path.join(dataDir, "videos");
   mkdirSync(dir, { recursive: true });
@@ -95,13 +175,13 @@ async function downloadOne(service: Service, videoId: number, url: string, dataD
   ] as const) {
     try {
       await attempt();
-      const durationSeconds = await probeDuration(out);
-      service.markVideo(videoId, { filePath: out, durationSeconds, status: "ready" });
-      return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       errors.push(`${name}：${message.includes("ENOENT") ? "服务器上没有安装" : message.split("\n")[0].slice(0, 120)}`);
+      continue;
     }
+    await finalizeVideo(service, videoId, out);
+    return;
   }
   service.markVideo(videoId, { status: "failed", error: `下载失败，请从相册上传。${errors.join("；")}` });
 }

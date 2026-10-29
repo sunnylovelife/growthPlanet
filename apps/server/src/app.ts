@@ -1,9 +1,9 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { enqueueDownload, probeDuration } from "./download.ts";
+import { enqueueDownload, enqueueTranscode, probeDuration } from "./download.ts";
 import { HttpError, createService, type Clock, type Service } from "./service.ts";
 
 type Ctx = { params: Record<string, string>; query: Record<string, string>; body: unknown; raw: Buffer; user: ReturnType<Service["publicUser"]> | null };
@@ -14,13 +14,50 @@ function send(res: ServerResponse, status: number, body: unknown) {
   res.end(payload);
 }
 
-function readRaw(req: IncomingMessage): Promise<Buffer> {
+const ANON_BODY_LIMIT = 64 * 1024;
+const AUTHED_BODY_LIMIT = 20 * 1024 * 1024;
+const MAX_UPLOAD_PARTS = 400;
+const UPLOAD_TTL_MS = 24 * 3600 * 1000;
+
+function readRaw(req: IncomingMessage, limit: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    if (Number(req.headers["content-length"] || 0) > limit) return reject(new HttpError(413, "内容太大了"));
     const chunks: Buffer[] = [];
-    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        req.removeAllListeners("data");
+        req.pause();
+        return reject(new HttpError(413, "内容太大了"));
+      }
+      chunks.push(Buffer.from(chunk));
+    });
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
+}
+
+function fromLocalProxy(req: IncomingMessage) {
+  const remote = req.socket.remoteAddress || "";
+  return remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+}
+
+function clientIp(req: IncomingMessage): string {
+  const forwarded = String(req.headers["x-forwarded-for"] || "");
+  if (forwarded && fromLocalProxy(req)) return forwarded.split(",").pop()!.trim();
+  return req.socket.remoteAddress || "";
+}
+
+function sessionCookie(req: IncomingMessage, value: string, maxAge: number) {
+  const secure = fromLocalProxy(req) && req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
+  return `gp_session=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+}
+
+function insideDir(root: string, rel: string): string | null {
+  const base = path.resolve(root);
+  const file = path.resolve(base, rel);
+  return file === base || file.startsWith(base + path.sep) ? file : null;
 }
 
 function cookies(req: IncomingMessage): Record<string, string> {
@@ -73,20 +110,32 @@ function matchRoute(method: string, url: string, routeMethod: string, pattern: s
 
 export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string; webRoot?: string }) {
   const service = createService(opts.db, opts.clock, opts.dataDir);
-  const uploads = new Map<string, { filename: string; dir: string; parts: number }>();
+  const uploads = new Map<string, { filename: string; dir: string; parts: number; createdAt: number }>();
+  const uploadsRoot = path.join(opts.dataDir, "uploads");
+  // 上传进度只存在内存里，启动时残留的分片都已无法续传
+  rmSync(uploadsRoot, { recursive: true, force: true });
+
+  function sweepUploads() {
+    for (const [id, slot] of uploads) {
+      if (Date.now() - slot.createdAt < UPLOAD_TTL_MS) continue;
+      uploads.delete(id);
+      rmSync(slot.dir, { recursive: true, force: true });
+    }
+  }
 
   const routes: { method: string; path: string; role?: "parent" | "child"; handler: (ctx: Ctx, res: ServerResponse, req: IncomingMessage) => Promise<unknown> }[] = [
     { method: "GET", path: "/api/ping", handler: async () => ({ ok: true, now: opts.clock.now().toISOString() }) },
-    { method: "POST", path: "/api/auth/login", handler: async (ctx, res) => {
+    { method: "POST", path: "/api/auth/login", handler: async (ctx, res, req) => {
       const body = ctx.body as { username?: string; password?: string; portal?: "kid" | "admin" };
-      const result = service.login(body.username || "", body.password || "", body.portal === "admin" ? "admin" : "kid", { device: reqHeader(res, "user-agent-store"), ip: "" });
-      res.setHeader("set-cookie", `gp_session=${result.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 3600}`);
+      const device = String(req.headers["user-agent"] || "").slice(0, 200);
+      const result = service.login(String(body.username || ""), String(body.password || ""), body.portal === "admin" ? "admin" : "kid", { device, ip: clientIp(req) });
+      res.setHeader("set-cookie", sessionCookie(req, result.token, 30 * 24 * 3600));
       return { user: result.user };
     } },
-    { method: "POST", path: "/api/auth/logout", handler: async (ctx, res) => {
+    { method: "POST", path: "/api/auth/logout", handler: async (ctx, res, req) => {
       const token = cookiesFromCtx(ctx);
       if (token) service.logout(token);
-      res.setHeader("set-cookie", "gp_session=; Path=/; HttpOnly; Max-Age=0");
+      res.setHeader("set-cookie", sessionCookie(req, "", 0));
       return { ok: true };
     } },
     { method: "GET", path: "/api/auth/me", role: undefined, handler: async (ctx) => ({ user: mustUser(ctx) }) },
@@ -132,34 +181,52 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
       enqueueDownload(service, Number(ctx.params.id), video.source_url, opts.dataDir);
       return { ok: true };
     } },
-    { method: "PATCH", path: "/api/admin/videos/:id", role: "parent", handler: async (ctx) => service.markVideo(Number(ctx.params.id), ctx.body as { title?: string; published?: boolean; durationSeconds?: number }) },
+    { method: "PATCH", path: "/api/admin/videos/:id", role: "parent", handler: async (ctx) => {
+      const body = ctx.body as { title?: unknown; published?: unknown; durationSeconds?: unknown };
+      return service.markVideo(Number(ctx.params.id), {
+        title: typeof body.title === "string" ? body.title : undefined,
+        published: typeof body.published === "boolean" ? body.published : undefined,
+        durationSeconds: Number.isFinite(body.durationSeconds) ? Number(body.durationSeconds) : undefined,
+      });
+    } },
     { method: "DELETE", path: "/api/admin/videos/:id", role: "parent", handler: async (ctx) => { service.deleteVideo(mustUser(ctx).id, Number(ctx.params.id)); return { ok: true }; } },
     { method: "POST", path: "/api/admin/uploads", role: "parent", handler: async (ctx) => {
       const body = ctx.body as { filename?: string; parts?: number };
+      const parts = Math.floor(Number(body.parts) || 1);
+      if (parts < 1 || parts > MAX_UPLOAD_PARTS) throw new HttpError(400, "视频太大了，最多 2GB");
+      sweepUploads();
       const id = randomBytes(8).toString("hex");
-      const dir = path.join(opts.dataDir, "uploads", id);
+      const dir = path.join(uploadsRoot, id);
       mkdirSync(dir, { recursive: true });
-      uploads.set(id, { filename: body.filename || "video.mp4", dir, parts: body.parts || 1 });
+      uploads.set(id, { filename: String(body.filename || "video.mp4").slice(0, 120), dir, parts, createdAt: Date.now() });
       return { id };
     } },
     { method: "PUT", path: "/api/admin/uploads/:id/chunks/:n", role: "parent", handler: async (ctx) => {
       const slot = uploads.get(ctx.params.id);
       if (!slot) throw new HttpError(404, "上传已失效，请重新选择");
-      writeFileSync(path.join(slot.dir, ctx.params.n), ctx.raw);
+      if (!/^\d+$/.test(ctx.params.n) || Number(ctx.params.n) >= slot.parts) throw new HttpError(400, "分片编号不对");
+      writeFileSync(path.join(slot.dir, String(Number(ctx.params.n))), ctx.raw);
       return { ok: true };
     } },
     { method: "POST", path: "/api/admin/uploads/:id/finish", role: "parent", handler: async (ctx) => {
       const slot = uploads.get(ctx.params.id);
       if (!slot) throw new HttpError(404, "上传已失效，请重新选择");
+      for (let i = 0; i < slot.parts; i++) if (!existsSync(path.join(slot.dir, String(i)))) throw new HttpError(400, "还有分片没传完，请重新上传");
       const dir = path.join(opts.dataDir, "videos");
       mkdirSync(dir, { recursive: true });
       const target = path.join(dir, `${Date.now()}.mp4`);
-      const out = createWriteStream(target);
-      for (let i = 0; i < slot.parts; i++) out.write(readFileSync(path.join(slot.dir, String(i))));
-      await new Promise((resolve, reject) => out.end((error?: Error | null) => error ? reject(error) : resolve(null)));
+      try {
+        const out = createWriteStream(target);
+        for (let i = 0; i < slot.parts; i++) out.write(readFileSync(path.join(slot.dir, String(i))));
+        await new Promise((resolve, reject) => out.end((error?: Error | null) => error ? reject(error) : resolve(null)));
+      } finally {
+        uploads.delete(ctx.params.id);
+        rmSync(slot.dir, { recursive: true, force: true });
+      }
       const duration = await probeDuration(target);
-      uploads.delete(ctx.params.id);
-      return service.saveUpload(mustUser(ctx).id, slot.filename, target, duration);
+      const saved = service.saveUpload(mustUser(ctx).id, slot.filename, target, duration);
+      enqueueTranscode(service, saved.id, target);
+      return saved;
     } },
     { method: "GET", path: "/api/admin/ledger", role: "parent", handler: async (ctx) => service.ledger(Number(ctx.query.childId)) },
     { method: "POST", path: "/api/admin/ledger/other", role: "parent", handler: async (ctx) => service.otherEntry(mustUser(ctx).id, ctx.body as { childIds: number[]; kind: "income" | "expense"; title: string; amount: number }) },
@@ -181,8 +248,6 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
   function cookiesFromCtx(ctx: Ctx) {
     return (ctx as Ctx & { token?: string }).token;
   }
-  function reqHeader(_res: ServerResponse, _name: string) { return ""; }
-
   const server = createServer(async (req, res) => {
     try {
       const url = req.url || "/";
@@ -198,11 +263,14 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
         const id = Number(url.split("/")[4]);
         return streamFile(req, res, service.photoFile(id), "image/jpeg");
       }
-      const raw = await readRaw(req);
-      const contentType = String(req.headers["content-type"] || "");
-      const body = contentType.includes("application/json") && raw.length ? JSON.parse(raw.toString("utf8")) : {};
       const token = cookies(req).gp_session;
       const user = service.userByToken(token);
+      const raw = await readRaw(req, user ? AUTHED_BODY_LIMIT : ANON_BODY_LIMIT);
+      const contentType = String(req.headers["content-type"] || "");
+      let body: unknown = {};
+      if (contentType.includes("application/json") && raw.length) {
+        try { body = JSON.parse(raw.toString("utf8")); } catch { throw new HttpError(400, "请求格式不对"); }
+      }
       for (const route of routes) {
         const matched = matchRoute(req.method || "GET", url, route.method, route.path);
         if (!matched) continue;
@@ -221,6 +289,7 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
       send(res, 404, { error: "没有这个页面" });
     } catch (error) {
       if (res.headersSent) return;
+      if (error instanceof HttpError && error.status === 413) res.setHeader("connection", "close");
       if (error instanceof HttpError) return send(res, error.status, { error: error.message });
       const message = error instanceof Error ? error.message : "";
       if (message.includes("UNIQUE")) return send(res, 400, { error: "已经存在，不能重复" });
@@ -232,44 +301,56 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
   return { server, service };
 }
 
-function streamFile(req: IncomingMessage, res: ServerResponse, file: string, type: string) {
+function streamFile(req: IncomingMessage, res: ServerResponse, file: string, type: string, cacheControl = "no-store") {
   const stat = statSync(file);
   const range = req.headers.range;
   if (range) {
     const matched = /bytes=(\d+)-(\d*)/.exec(range);
     const start = Number(matched?.[1] ?? 0);
-    const end = matched?.[2] ? Number(matched[2]) : stat.size - 1;
-    res.writeHead(206, { "content-type": type, "accept-ranges": "bytes", "content-range": `bytes ${start}-${end}/${stat.size}`, "content-length": end - start + 1, "cache-control": "no-store" });
+    const end = Math.min(matched?.[2] ? Number(matched[2]) : stat.size - 1, stat.size - 1);
+    if (start > end) {
+      res.writeHead(416, { "content-range": `bytes */${stat.size}` });
+      res.end();
+      return;
+    }
+    res.writeHead(206, { "content-type": type, "accept-ranges": "bytes", "content-range": `bytes ${start}-${end}/${stat.size}`, "content-length": end - start + 1, "cache-control": cacheControl });
     createReadStream(file, { start, end }).pipe(res);
     return;
   }
-  res.writeHead(200, { "content-type": type, "content-length": stat.size, "accept-ranges": "bytes", "cache-control": "no-store" });
+  res.writeHead(200, { "content-type": type, "content-length": stat.size, "accept-ranges": "bytes", "cache-control": cacheControl });
   createReadStream(file).pipe(res);
 }
 
 function serveWeb(webRoot: string, url: string, res: ServerResponse) {
-  const adminRoot = path.join(webRoot, "apps/admin/dist");
-  const kidRoot = path.join(webRoot, "apps/kid/dist");
-  if (url === "/admin" || url.startsWith("/admin/")) {
-    if (!existsSync(adminRoot)) return false;
-    const rel = url.replace(/^\/admin\/?/, "") || "index.html";
-    const file = path.normalize(path.join(adminRoot, rel));
-    const target = existsSync(file) && statSync(file).isFile() ? file : path.join(adminRoot, "index.html");
-    streamFile({ headers: {} } as IncomingMessage, res, target, mime(target));
-    return true;
-  }
-  if (!existsSync(kidRoot) || url.startsWith("/api")) return false;
-  const file = path.normalize(path.join(kidRoot, url === "/" ? "index.html" : url));
-  const target = file.startsWith(kidRoot) && existsSync(file) && statSync(file).isFile() ? file : path.join(kidRoot, "index.html");
-  streamFile({ headers: {} } as IncomingMessage, res, target, mime(target));
+  const isAdmin = url === "/admin" || url.startsWith("/admin/");
+  if (!isAdmin && url.startsWith("/api")) return false;
+  const root = path.join(webRoot, isAdmin ? "apps/admin/dist" : "apps/kid/dist");
+  if (!existsSync(root)) return false;
+  const rel = (isAdmin ? url.replace(/^\/admin\/?/, "") : url.replace(/^\/+/, "")) || "index.html";
+  const file = insideDir(root, rel);
+  const target = file && existsSync(file) && statSync(file).isFile() ? file : path.join(root, "index.html");
+  // 带哈希的打包产物可以长期缓存；index.html、sw.js 等每次都要回源确认
+  const cache = target.includes(`${path.sep}assets${path.sep}`) ? "public, max-age=31536000, immutable" : "no-cache";
+  streamFile({ headers: {} } as IncomingMessage, res, target, mime(target), cache);
   return true;
 }
 
+const MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".json": "application/json",
+  ".webmanifest": "application/manifest+json",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+  ".mp3": "audio/mpeg",
+};
+
 function mime(file: string) {
-  if (file.endsWith(".html")) return "text/html; charset=utf-8";
-  if (file.endsWith(".js")) return "text/javascript; charset=utf-8";
-  if (file.endsWith(".css")) return "text/css; charset=utf-8";
-  if (file.endsWith(".svg")) return "image/svg+xml";
-  if (file.endsWith(".json")) return "application/json";
-  return "application/octet-stream";
+  return MIME[path.extname(file).toLowerCase()] ?? "application/octet-stream";
 }

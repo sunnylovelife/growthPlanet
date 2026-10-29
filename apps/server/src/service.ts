@@ -1,5 +1,5 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
@@ -99,9 +99,29 @@ export function verifyPassword(password: string, stored: string): boolean {
   return timingSafeEqual(got, expected);
 }
 
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const ACCOUNT_FAIL_LIMIT = 5;
+const IP_FAIL_LIMIT = 20;
+
 export function createService(db: DatabaseSync, clock: Clock, dataDir: string) {
   function nowIso() {
     return toShanghaiIso(clock.now());
+  }
+
+  // 失败次数按"IP + 账号"计，外人猜密码锁不住家里 iPad 上的账号
+  const loginFailures = new Map<string, number[]>();
+
+  function recentFailures(key: string): number {
+    const now = clock.now().getTime();
+    const list = (loginFailures.get(key) ?? []).filter((at) => now - at < LOGIN_WINDOW_MS);
+    if (list.length) loginFailures.set(key, list);
+    else loginFailures.delete(key);
+    return list.length;
+  }
+
+  function recordFailure(key: string) {
+    if (loginFailures.size > 5000) for (const stale of [...loginFailures.keys()]) recentFailures(stale);
+    loginFailures.set(key, [...(loginFailures.get(key) ?? []), clock.now().getTime()]);
   }
 
   function economy(): Economy {
@@ -284,37 +304,42 @@ export function createService(db: DatabaseSync, clock: Clock, dataDir: string) {
       run(db, "INSERT INTO setting (key, value_json) VALUES ('economy', ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json", JSON.stringify(next));
       logAction(parentId, "save_economy", "setting", "economy", next);
     },
-    seed() {
-      if (one(db, "SELECT id FROM user LIMIT 1")) return;
+    seed(initialPassword?: string) {
+      if (one(db, "SELECT id FROM user LIMIT 1")) return null;
       const stamp = nowIso();
-      const parent = run(db, "INSERT INTO user (username, password_hash, role, display_role, status, created_at) VALUES (?, ?, 'parent', '爸爸', 'active', ?)", "parent", hashPassword("123456"), stamp);
-      const boy = run(db, "INSERT INTO user (username, password_hash, role, display_role, status, created_at) VALUES (?, ?, 'child', '儿子', 'active', ?)", "boy", hashPassword("123456"), stamp);
-      const girl = run(db, "INSERT INTO user (username, password_hash, role, display_role, status, created_at) VALUES (?, ?, 'child', '女儿', 'active', ?)", "girl", hashPassword("123456"), stamp);
+      const credentials = ["parent", "boy", "girl"].map((username) => ({ username, password: initialPassword || randomBytes(6).toString("base64url") }));
+      const [parentPw, boyPw, girlPw] = credentials.map((item) => hashPassword(item.password));
+      const parent = run(db, "INSERT INTO user (username, password_hash, role, display_role, status, created_at) VALUES (?, ?, 'parent', '爸爸', 'active', ?)", "parent", parentPw, stamp);
+      const boy = run(db, "INSERT INTO user (username, password_hash, role, display_role, status, created_at) VALUES (?, ?, 'child', '儿子', 'active', ?)", "boy", boyPw, stamp);
+      const girl = run(db, "INSERT INTO user (username, password_hash, role, display_role, status, created_at) VALUES (?, ?, 'child', '女儿', 'active', ?)", "girl", girlPw, stamp);
       run(db, "INSERT INTO child_profile (user_id, nickname, outfit_id) VALUES (?, '小宇', 'rocket')", boy.id);
       run(db, "INSERT INTO child_profile (user_id, nickname, outfit_id) VALUES (?, '小星', 'magic')", girl.id);
       run(db, "INSERT INTO setting (key, value_json) VALUES ('economy', ?)", JSON.stringify(DEFAULT_ECONOMY));
       run(db, "INSERT INTO pity (child_id, counter) VALUES (?, 0)", boy.id);
       run(db, "INSERT INTO pity (child_id, counter) VALUES (?, 0)", girl.id);
       logEvent(parent.id, "seed", { parent: parent.id });
+      return credentials;
     },
     ensureCurrentWeeks,
     login(username: string, password: string, portal: "kid" | "admin", meta: { ip?: string; device?: string }) {
-      const user = one<UserRow>(db, "SELECT * FROM user WHERE username = ?", username.trim());
+      const name = username.trim();
+      const ip = meta.ip || "unknown";
+      const ipKey = `ip:${ip}`;
+      const accountKey = `account:${ip}:${name}`;
+      if (recentFailures(ipKey) >= IP_FAIL_LIMIT) throw new HttpError(429, "尝试太频繁，请 10 分钟后再试");
+      if (recentFailures(accountKey) >= ACCOUNT_FAIL_LIMIT) throw new HttpError(423, "密码错太多次，请 10 分钟后再试");
+      const user = one<UserRow>(db, "SELECT * FROM user WHERE username = ?", name);
       const stamp = nowIso();
-      if (user?.locked_until && user.locked_until > stamp) throw new HttpError(423, "密码错太多次，请 10 分钟后再试");
       const ok = Boolean(user && user.status === "active" && verifyPassword(password, user.password_hash));
-      run(db, "INSERT INTO login_log (username, user_id, success, ip, device, created_at) VALUES (?, ?, ?, ?, ?, ?)", username, user?.id ?? null, ok ? 1 : 0, meta.ip ?? null, meta.device ?? null, stamp);
+      run(db, "INSERT INTO login_log (username, user_id, success, ip, device, created_at) VALUES (?, ?, ?, ?, ?, ?)", name, user?.id ?? null, ok ? 1 : 0, meta.ip ?? null, meta.device ?? null, stamp);
       if (!user || !ok) {
-        if (user) {
-          const fails = user.failed_login_count + 1;
-          const locked = fails >= 5 ? toShanghaiIso(new Date(clock.now().getTime() + 10 * 60 * 1000)) : null;
-          run(db, "UPDATE user SET failed_login_count = ?, locked_until = ? WHERE id = ?", fails, locked, user.id);
-        }
+        recordFailure(ipKey);
+        recordFailure(accountKey);
         throw new HttpError(401, "用户名或密码不对");
       }
       if (portal === "admin" && user.role !== "parent") throw new HttpError(403, "孩子账号不能进家长后台");
       if (portal === "kid" && user.role !== "child") throw new HttpError(403, "请用孩子账号登录");
-      run(db, "UPDATE user SET failed_login_count = 0, locked_until = NULL WHERE id = ?", user.id);
+      loginFailures.delete(accountKey);
       const token = randomBytes(24).toString("hex");
       const expires = toShanghaiIso(new Date(clock.now().getTime() + 30 * 24 * 3600 * 1000));
       run(db, "INSERT INTO session (token, user_id, created_at, expires_at, device, ip) VALUES (?, ?, ?, ?, ?, ?)", token, user.id, stamp, expires, meta.device ?? null, meta.ip ?? null);
@@ -636,8 +661,16 @@ export function createService(db: DatabaseSync, clock: Clock, dataDir: string) {
       return one(db, "SELECT * FROM video WHERE id = ?", id);
     },
     deleteVideo(parentId: number, id: number) {
+      const video = one<{ file_path: string | null; status: string }>(db, "SELECT file_path, status FROM video WHERE id = ?", id);
+      if (video && (video.status === "downloading" || video.status === "processing")) throw new HttpError(400, "视频还在处理，等一会儿再删");
       run(db, "DELETE FROM video WHERE id = ?", id);
+      const videosDir = path.resolve(dataDir, "videos") + path.sep;
+      if (video?.file_path && path.resolve(video.file_path).startsWith(videosDir)) rmSync(video.file_path, { force: true });
       logAction(parentId, "delete_video", "video", String(id), {});
+    },
+    unfinishedVideos() {
+      return many<{ id: number; status: string; source_url: string | null; file_path: string | null }>(db,
+        "SELECT id, status, source_url, file_path FROM video WHERE status IN ('queued', 'downloading', 'processing') ORDER BY id");
     },
     saveUpload(parentId: number, filename: string, filePath: string, durationSeconds: number) {
       const id = run(db, `INSERT INTO video (title, file_path, duration_seconds, status, published, created_at) VALUES (?, ?, ?, 'ready', 0, ?)`,
@@ -706,6 +739,8 @@ export function createService(db: DatabaseSync, clock: Clock, dataDir: string) {
       if (input.password) {
         if (input.password.length < 4) throw new HttpError(400, "密码至少 4 位");
         run(db, "UPDATE user SET password_hash = ?, failed_login_count = 0, locked_until = NULL WHERE id = ?", hashPassword(input.password), id);
+        const username = one<{ username: string }>(db, "SELECT username FROM user WHERE id = ?", id)?.username;
+        for (const key of [...loginFailures.keys()]) if (username && key.startsWith("account:") && key.endsWith(`:${username}`)) loginFailures.delete(key);
       }
       if (input.status) run(db, "UPDATE user SET status = ? WHERE id = ?", input.status, id);
       if (input.displayRole) run(db, "UPDATE user SET display_role = ? WHERE id = ?", input.displayRole, id);

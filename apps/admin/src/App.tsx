@@ -21,6 +21,14 @@ interface ChildToday {
   balance: number;
   tasks: Task[];
 }
+const VIDEO_STATUS: Record<string, string> = {
+  queued: "排队中",
+  downloading: "下载中",
+  processing: "转码中",
+  ready: "可以播放",
+  failed: "失败",
+};
+
 interface VideoRow {
   id: number;
   title: string;
@@ -98,7 +106,7 @@ export function App() {
       setProgress(`${Math.round(((i + 1) / parts) * 100)}%`);
     }
     await api(`/api/admin/uploads/${created.id}/finish`, { method: "POST", body: "{}" });
-    setProgress("上传完成，记得上架");
+    setProgress("上传完成，转码好之后记得上架");
     setVideos((await api<{ videos: VideoRow[] }>("/api/admin/videos")).videos);
   }
 
@@ -112,7 +120,6 @@ export function App() {
           <input name="password" type="password" placeholder="密码" />
           {error && <p className="error">{error}</p>}
           <button className="primary" type="submit">登录</button>
-          <p className="muted">初始账号 parent / 123456</p>
         </form>
       </div>
     );
@@ -187,7 +194,7 @@ export function App() {
           {videos.map((video) => (
             <article className="card" key={video.id}>
               <h2>{video.title}</h2>
-              <p className="muted">{video.status} · {video.duration_seconds} 秒 {video.published ? "· 已上架" : "· 未上架"}</p>
+              <p className="muted">{VIDEO_STATUS[video.status] ?? video.status} · {video.duration_seconds} 秒 {video.published ? "· 已上架" : "· 未上架"}</p>
               {video.error && <p className="error">{video.error}</p>}
               <div className="row">
                 <button className="primary" onClick={() => api(`/api/admin/videos/${video.id}`, { method: "PATCH", body: JSON.stringify({ published: !video.published }) }).then(() => api<{ videos: VideoRow[] }>("/api/admin/videos")).then((res) => setVideos(res.videos))}>{video.published ? "下架" : "上架"}</button>

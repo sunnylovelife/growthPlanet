@@ -60,7 +60,11 @@ iPad / 手机浏览器
 | 数据目录 | 固定为 `<仓库根目录>/data`，不可配置 |
 | 浏览器 | 环境变量 `CHROMIUM_PATH` 可指定 Chromium；不设则用 playwright 自带的 |
 | 时区 | 业务代码固定按北京时间（`+08:00`）计算，服务器系统时区无所谓 |
-| 首次启动 | 数据库为空时自动创建账号 `parent` / `boy` / `girl`，密码都是 `123456`；有 ffmpeg 时生成一条欢迎视频 |
+| 首次启动 | 数据库为空时自动创建账号 `parent` / `boy` / `girl`，**密码随机生成，只在第一次启动的日志里打印一次**；可用环境变量 `GP_INIT_PASSWORD` 指定统一的初始密码。有 ffmpeg 时生成一条欢迎视频 |
+| 请求体上限 | 未登录 64KB，已登录 20MB（分片上传每片 5MB） |
+| 视频处理 | 下载或上传后自动检查，不是"720p 以内 H.264/AAC MP4"的会转码；下载、转码共用一个队列，一次只处理一个 |
+| 登录保护 | 同一 IP 对同一账号 10 分钟内错 5 次锁该 IP；同一 IP 累计错 20 次整体拒绝。外人猜密码不会锁住家里的 iPad |
+| 重启恢复 | 启动时自动续上"排队中 / 下载中 / 转码中"的视频；未完成的相册分片上传会被清理，需要重新上传 |
 
 ## 2. 准备域名
 
@@ -246,6 +250,17 @@ find /home/growth/.cache/ms-playwright -type f \( -name 'chrome-headless-shell' 
 su - growth -c "cd /opt/growthPlanet && HOST=127.0.0.1 PORT=8787 node --experimental-strip-types apps/server/src/index.ts"
 ```
 
+**这是第一次启动，日志会打印三个初始账号的随机密码，立刻抄下来**（只显示这一次）：
+
+```
+已创建初始账号（只显示这一次，请登录家长后台后立即修改密码）：
+  parent / xxxxxxxx
+  boy / xxxxxxxx
+  girl / xxxxxxxx
+```
+
+万一没抄到：停掉服务，删除 `/opt/growthPlanet/data/growth.sqlite*` 再启动一次即可重新生成（仅限还没开始使用时）。
+
 看到 `成长星球已启动` 后，另开一个 SSH 窗口验证：
 
 ```bash
@@ -304,9 +319,14 @@ journalctl -u growth-planet -f      # 实时查看日志
 ```caddyfile
 growth.example.com {
 	encode zstd gzip
+	request_body {
+		max_size 25MB
+	}
 	reverse_proxy 127.0.0.1:8787
 }
 ```
+
+`request_body` 在 Caddy 这一层就挡掉超大请求，不让它到达 Node 进程（服务自身也限制了 20MB）。
 
 ```bash
 caddy validate --config /etc/caddy/Caddyfile
@@ -325,7 +345,7 @@ setsebool -P httpd_can_network_connect 1
 
 ## 7. 上线后必做
 
-1. **立即修改默认密码**：打开 `https://growth.example.com/admin/`，用 `parent / 123456` 登录，在账号管理里把家长和两个孩子的密码都改掉。服务暴露在公网，这一步不能省。
+1. **修改初始密码**：打开 `https://growth.example.com/admin/`，用 4.4 节抄下的 `parent` 密码登录，在账号管理里把家长和两个孩子的密码改成自己记得住的。
 2. **iPad 安装到主屏幕**：iPad 用 Safari 打开 `https://growth.example.com/` → 分享 → 添加到主屏幕，之后从主屏幕图标启动即为全屏模式。
 3. **实测抖音下载**：在家长后台粘贴一条抖音分享文案，同时在另一个窗口执行 `free -h` 和 `docker stats --no-stream` 观察内存，确认现有容器没受影响。海外 IP 被抖音风控是常见情况，失败时用"从相册上传"兜底。
 4. **KiwiVM 打快照**：一切正常后在面板手动打一个快照。
@@ -347,8 +367,8 @@ systemctl restart growth-planet
 
 注意：
 
-- 下载队列和分片上传进度都保存在内存中，**重启会中断正在进行的下载/上传**。重启前到后台确认没有"下载中"的视频；中断的视频可点"重试"。
-- 数据库表结构用 `CREATE TABLE IF NOT EXISTS` 创建，**新增字段不会自动加到已有表上**。以后若改了表结构，需要手动写 `ALTER TABLE`，上线前务必先备份。
+- 重启后排队中、下载中、转码中的视频会自动续上；但**正在进行的相册分片上传会中断**，需要家长重新上传。
+- 表结构变更写在 `apps/server/src/db.ts` 的 `MIGRATIONS` 数组末尾（加字段用 `addColumn`），服务启动时按 `PRAGMA user_version` 只执行新增的条目。涉及表结构的更新，上线前先按 9.1 节手动备份一次数据库。
 - 如果 `playwright-core` 版本升级，需要重新执行 4.3 节安装对应版本的 Chromium。
 - 孩子端有 Service Worker 缓存页面，更新后 iPad 上可能要完全关闭应用再打开一次才能看到新版本。
 
@@ -406,11 +426,12 @@ systemctl start growth-planet
 | 视频下载失败："yt-dlp：服务器上没有安装" | 3.8 节未完成，或 systemd 文件 `PATH` 里没有 `/usr/local/bin` |
 | 服务频繁重启，日志里有 `oom-kill` | 触发了 `MemoryMax`，多半是下载时 Chromium 太占内存；可删掉 Chromium（见 4.3 节末尾）只用相册上传 |
 | 现有容器变慢 | `free -h` 看 swap 是否打满；`docker stats --no-stream` 看各容器占用；必要时 `systemctl stop growth-planet` 先停本服务 |
-| 硬盘满了 | `du -sh /opt/growthPlanet/data/*`，在后台删除不用的视频；`data/uploads/` 下中断上传的残留目录可以手动删掉 |
+| 硬盘满了 | `du -sh /opt/growthPlanet/data/*`，在后台删除不用的视频（视频文件会一起删掉） |
+| 登录提示"尝试太频繁"或"密码错太多次" | 同一网络 10 分钟内输错太多次，等 10 分钟；或在家长后台重置该账号密码立即解锁 |
+| 视频一直"转码中" | 2 核机器转一个 10 分钟的视频要几分钟，且队列一次只处理一个；`journalctl -u growth-planet` 看是否有报错，`top` 看 ffmpeg 是否在跑 |
 
 ## 11. 已知限制（部署相关）
 
 - 1GB 内存是硬约束：现有容器加本服务已接近上限，抖音下载（Chromium）会明显依赖 swap。家庭场景下载频率低，可以接受；若长期卡顿，建议升级到 2GB 套餐。
-- iPad 主屏幕图标目前用的是 SVG，iOS 不支持 SVG 作为 `apple-touch-icon`，会显示为页面截图。需要时补一张 180×180 的 PNG 图标。
-- 后台"从相册上传"的视频不会转码，iPhone 拍的 HEVC 视频在 iPad 上能播，但体积较大。
-- 登录日志目前没有记录真实 IP（代码里写的是空字符串）。若要记录，需要读取 Caddy 转发的 `X-Forwarded-For` 头。
+- 转码很吃 CPU：2 核机器转码期间整机会比较忙，现有容器可能短暂变慢。家庭场景上传频率低，可以接受。
+- 登录失败计数保存在内存里，服务重启后清零。
