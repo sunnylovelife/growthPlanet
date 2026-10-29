@@ -1,0 +1,9 @@
+{
+  "name": "growth-planet",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "test": "node --experimental-strip-types --test packages/shared/test/*.test.ts apps/server/test/*.test.ts",
+    "start": "node --experimental-strip-types apps/server/src/index.ts"
+  }
+}
