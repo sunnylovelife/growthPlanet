@@ -31,7 +31,8 @@ setInterval(() => {
 service.runJobs();
 
 const port = Number(process.env.PORT || 8787);
-server.listen(port, "0.0.0.0", () => {
+const host = process.env.HOST || "0.0.0.0";
+server.listen(port, host, () => {
   console.log(`成长星球已启动 http://localhost:${port}`);
   console.log("孩子端开发地址 http://localhost:5173    家长后台 http://localhost:5174");
   console.log("初始账号  家长 parent / 123456    儿子 boy / 123456    女儿 girl / 123456");
