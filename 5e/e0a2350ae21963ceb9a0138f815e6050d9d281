@@ -1,0 +1,34 @@
+apps/admin/src/App.tsx
+  h_15504845cc6f56 24-31,109,197
+apps/kid/index.html
+  h_15504845cc6f56 12
+apps/kid/public/manifest.webmanifest
+  h_15504845cc6f56 10-14
+apps/server/src/app.ts
+  h_15504845cc6f56 1,6,17-22,24,26-35,41-62,113-124,128,130-132,135,138,184-191,195-197,199,201,207-208,214,218-225,227-229,268-273,292,304,310-316,320,325-334,338-353,355
+apps/server/src/db.ts
+  h_15504845cc6f56 190-209
+apps/server/src/download.ts
+  h_15504845cc6f56 2,33-102,156-165,181,183-184
+apps/server/src/index.ts
+  h_15504845cc6f56 7,15-24
+apps/server/src/service.ts
+  h_15504845cc6f56 2,102-105,111-126,307-308,310-314,321,325-331,334,336-337,342,664-665,667-668,671-674,742-743
+apps/server/test/api.test.ts
+  h_15504845cc6f56 2-3,9-10,12,17-18,29,32-33,228-333
+apps/server/test/download.test.ts
+  h_15504845cc6f56 3-17
+docs/04-deploy.md
+  h_15504845cc6f56 63-67,253-263,322-324,329-330,348,370-371,429-431,436-437
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5ee0a2350ae21963ceb9a0138f815e6050d9d281",
+  "prompts": {},
+  "humans": {
+    "h_15504845cc6f56": {
+      "author": "sunnylovelife <602546990@qq.com>"
+    }
+  }
+}
