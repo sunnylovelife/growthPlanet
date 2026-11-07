@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, flushEvents, track } from "./api";
+import { api, flushEvents, newId, track } from "./api";
 import { RewardShow, type ClaimResult } from "./RewardShow";
 
 interface Task {
@@ -138,7 +138,7 @@ export function App() {
     const quoted = await api<VideoItem["quote"]>(`/api/videos/${quote.video.id}/quote`);
     const result = await api<{ watchId?: number; token?: string; reprice?: boolean; price?: number; balance?: number }>(`/api/videos/${quote.video.id}/play`, {
       method: "POST",
-      body: JSON.stringify({ quotedPrice: quoted.price, idempotencyKey: crypto.randomUUID() }),
+      body: JSON.stringify({ quotedPrice: quoted.price, idempotencyKey: newId() }),
     });
     if (result.reprice) {
       setQuote({ ...quote, text: `价格变成 ${result.price} 星币了，再确认一次` });
