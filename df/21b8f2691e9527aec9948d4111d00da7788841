@@ -1,0 +1,18 @@
+apps/kid/src/App.tsx
+  h_15504845cc6f56 2,141
+apps/kid/src/api.ts
+  h_15504845cc6f56 10-15,17
+docs/05-home-mac-vm.md
+  h_15504845cc6f56 1-312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "df21b8f2691e9527aec9948d4111d00da7788841",
+  "prompts": {},
+  "humans": {
+    "h_15504845cc6f56": {
+      "author": "sunnylovelife <602546990@qq.com>"
+    }
+  }
+}
