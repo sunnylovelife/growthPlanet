@@ -184,10 +184,14 @@ export function videoPrice(dailyIndex: number, durationSeconds: number, pricing:
 }
 
 export function extractDouyin(text: string): { url?: string; title?: string; author?: string } {
-  const url = text.match(/https?:\/\/v\.douyin\.com\/[A-Za-z0-9_-]+\/?/)?.[0];
   const title = text.match(/《([^》]+)》/)?.[1];
   const author = text.match(/【([^】]+)】/)?.[1];
-  return { url, title, author };
+  const short = text.match(/https?:\/\/v\.douyin\.com\/[A-Za-z0-9_-]+\/?/)?.[0];
+  if (short) return { url: short, title, author };
+  const videoId = text.match(/https?:\/\/(?:[a-z0-9-]+\.)*(?:douyin|iesdouyin)\.com\/(?:share\/)?video\/(\d{15,25})/)?.[1]
+    ?? text.match(/(?<!\d)(\d{19})(?!\d)/)?.[1];
+  if (videoId) return { url: `https://www.douyin.com/video/${videoId}`, title, author };
+  return { url: undefined, title, author };
 }
 
 export function pickWeighted<T>(items: T[], weight: (item: T) => number, rand: () => number): T {

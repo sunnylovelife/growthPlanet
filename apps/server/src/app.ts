@@ -110,7 +110,7 @@ function matchRoute(method: string, url: string, routeMethod: string, pattern: s
 
 export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string; webRoot?: string }) {
   const service = createService(opts.db, opts.clock, opts.dataDir);
-  const uploads = new Map<string, { filename: string; dir: string; parts: number; createdAt: number }>();
+  const uploads = new Map<string, { filename: string; dir: string; parts: number; createdAt: number; videoId?: number }>();
   const uploadsRoot = path.join(opts.dataDir, "uploads");
   // 上传进度只存在内存里，启动时残留的分片都已无法续传
   rmSync(uploadsRoot, { recursive: true, force: true });
@@ -191,14 +191,15 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
     } },
     { method: "DELETE", path: "/api/admin/videos/:id", role: "parent", handler: async (ctx) => { service.deleteVideo(mustUser(ctx).id, Number(ctx.params.id)); return { ok: true }; } },
     { method: "POST", path: "/api/admin/uploads", role: "parent", handler: async (ctx) => {
-      const body = ctx.body as { filename?: string; parts?: number };
+      const body = ctx.body as { filename?: string; parts?: number; videoId?: number };
       const parts = Math.floor(Number(body.parts) || 1);
       if (parts < 1 || parts > MAX_UPLOAD_PARTS) throw new HttpError(400, "视频太大了，最多 2GB");
       sweepUploads();
       const id = randomBytes(8).toString("hex");
       const dir = path.join(uploadsRoot, id);
       mkdirSync(dir, { recursive: true });
-      uploads.set(id, { filename: String(body.filename || "video.mp4").slice(0, 120), dir, parts, createdAt: Date.now() });
+      const fillId = Number(body.videoId);
+      uploads.set(id, { filename: String(body.filename || "video.mp4").slice(0, 120), dir, parts, createdAt: Date.now(), videoId: Number.isFinite(fillId) && fillId > 0 ? fillId : undefined });
       return { id };
     } },
     { method: "PUT", path: "/api/admin/uploads/:id/chunks/:n", role: "parent", handler: async (ctx) => {
@@ -224,7 +225,9 @@ export function buildApp(opts: { db: DatabaseSync; clock: Clock; dataDir: string
         rmSync(slot.dir, { recursive: true, force: true });
       }
       const duration = await probeDuration(target);
-      const saved = service.saveUpload(mustUser(ctx).id, slot.filename, target, duration);
+      const saved = slot.videoId
+        ? service.fillVideo(mustUser(ctx).id, slot.videoId, target, duration)
+        : service.saveUpload(mustUser(ctx).id, slot.filename, target, duration);
       enqueueTranscode(service, saved.id, target);
       return saved;
     } },

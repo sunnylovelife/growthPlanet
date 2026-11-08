@@ -696,6 +696,15 @@ export function createService(db: DatabaseSync, clock: Clock, dataDir: string) {
       logAction(parentId, "upload_video", "video", String(id), { filename });
       return { id };
     },
+    /** 抖音链接下载失败后，家长从相册补上视频文件：沿用手动上传流程，但复用原来那条记录，标题和封面都保留。 */
+    fillVideo(parentId: number, id: number, filePath: string, durationSeconds: number) {
+      const video = one(db, "SELECT id FROM video WHERE id = ?", id);
+      if (!video) throw new HttpError(404, "视频不存在");
+      run(db, `UPDATE video SET file_path = ?, duration_seconds = ?, status = 'ready', error = NULL WHERE id = ?`,
+        filePath, durationSeconds, id);
+      logAction(parentId, "upload_video", "video", String(id), { fill: true });
+      return { id };
+    },
     events(filters: { childId?: number; type?: string }) {
       const clauses = ["1=1"];
       const params: unknown[] = [];

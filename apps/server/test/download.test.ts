@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { estimateEta, needsTranscode, parseFfmpegOutTime, parseYtDlpProgress, pickPlayUrls, type ProbeInfo } from "../src/download.ts";
+import { estimateEta, needsTranscode, parseDouyinSeo, parseFfmpegOutTime, parseYtDlpProgress, pickPlayUrls, type ProbeInfo } from "../src/download.ts";
 
 const ipadFriendly: ProbeInfo = { formatName: "mov,mp4,m4a,3gp,3g2,mj2", bitRate: 1_500_000, video: { codec: "h264", width: 1280, height: 720, pixFmt: "yuv420p" }, audioCodec: "aac" };
 
@@ -50,4 +50,21 @@ test("抖音视频优先选不超过 720p 的最高码率 H.264", () => {
 test("没有合适清晰度时退回最高码率 H.264，再退回默认地址", () => {
   assert.deepEqual(pickPlayUrls({ bit_rate: [{ bit_rate: 1, is_h265: 0, play_addr: { url_list: ["only-1080"], width: 1920, height: 1080 } }] }), ["only-1080"]);
   assert.deepEqual(pickPlayUrls({ play_addr: { url_list: ["default"] }, bit_rate: [] }), ["default"]);
+});
+
+test("能从抖音 SEO 页的 ld+json 里取出标题、作者和封面", () => {
+  const html = `<html><head>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[]}</script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"VideoObject","name":"你对我的好我一直记得#双子座","description":"萧萧不吃辣发布在抖音","thumbnailUrl":["https://p3.douyinpic.com/a.jpeg","https://p9.douyinpic.com/b.jpeg"],"uploadDate":"2024-05-24T16:46:14+08:00Z","creator":{"@type":"Person","name":"萧萧不吃辣"}}</script>
+</head></html>`;
+  const meta = parseDouyinSeo(html);
+  assert.equal(meta.title, "你对我的好我一直记得#双子座");
+  assert.equal(meta.author, "萧萧不吃辣");
+  assert.deepEqual(meta.covers, ["https://p3.douyinpic.com/a.jpeg", "https://p9.douyinpic.com/b.jpeg"]);
+});
+
+test("SEO 页没有 VideoObject 或 JSON 坏掉时返回空结果，不抛错", () => {
+  assert.deepEqual(parseDouyinSeo("<html></html>"), { covers: [] });
+  assert.deepEqual(parseDouyinSeo(`<script type="application/ld+json">{坏掉的}</script>`), { covers: [] });
+  assert.deepEqual(parseDouyinSeo(`<script type="application/ld+json">{"@type":"VideoObject","name":"  标题  "}</script>`).title, "标题");
 });

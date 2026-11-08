@@ -74,6 +74,18 @@ test("能从抖音分享文案里抽出链接和标题", () => {
   assert.equal(parsed.author, "孩子的一棠课的作品");
 });
 
+test("直接粘贴网页链接或裸视频 ID 也能认出来", () => {
+  const cases: [string, string][] = [
+    ["https://www.douyin.com/video/7372484719365098803", "https://www.douyin.com/video/7372484719365098803"],
+    ["https://www.douyin.com/video/7372484719365098803?previous_page=app_code_link", "https://www.douyin.com/video/7372484719365098803"],
+    ["https://m.douyin.com/share/video/7372484719365098803", "https://www.douyin.com/video/7372484719365098803"],
+    ["https://www.iesdouyin.com/share/video/7372484719365098803/", "https://www.douyin.com/video/7372484719365098803"],
+    ["7372484719365098803", "https://www.douyin.com/video/7372484719365098803"],
+  ];
+  for (const [text, expected] of cases) assert.equal(extractDouyin(text).url, expected);
+  assert.equal(extractDouyin("随便一段没有链接的文字").url, undefined);
+});
+
 test("连续 8 次没出稀有时，下一次至少是稀有", () => {
   const alwaysCommon = () => 0;
   const forced = drawCard(7, alwaysCommon, 8);

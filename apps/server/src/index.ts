@@ -7,7 +7,8 @@ import { buildApp } from "./app.ts";
 import { enqueueDownload, enqueueTranscode } from "./download.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const dataDir = path.join(root, "data");
+// GP_DATA_DIR 让 e2e / 多实例可以各用各的数据目录，互不干扰
+const dataDir = process.env.GP_DATA_DIR ? path.resolve(process.env.GP_DATA_DIR) : path.join(root, "data");
 mkdirSync(dataDir, { recursive: true });
 const db = openDatabase(path.join(dataDir, "growth.sqlite"));
 migrate(db);

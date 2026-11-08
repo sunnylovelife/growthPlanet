@@ -141,10 +141,10 @@ export function App() {
     await loadToday();
   }
 
-  async function upload(file: File) {
+  async function upload(file: File, videoId?: number) {
     const chunkSize = 5 * 1024 * 1024;
     const parts = Math.max(1, Math.ceil(file.size / chunkSize));
-    const created = await api<{ id: string }>("/api/admin/uploads", { method: "POST", body: JSON.stringify({ filename: file.name, parts }) });
+    const created = await api<{ id: string }>("/api/admin/uploads", { method: "POST", body: JSON.stringify({ filename: file.name, parts, videoId }) });
     for (let i = 0; i < parts; i++) {
       const blob = file.slice(i * chunkSize, (i + 1) * chunkSize);
       const res = await fetch(`/api/admin/uploads/${created.id}/chunks/${i}`, { method: "PUT", credentials: "include", headers: { "content-type": "application/octet-stream" }, body: blob });
@@ -233,7 +233,7 @@ export function App() {
             <h2>粘贴抖音分享</h2>
             <textarea value={share} onChange={(event) => setShare(event.target.value)} placeholder="把抖音分享文字粘到这里" />
             <button className="primary" onClick={() => api("/api/admin/videos", { method: "POST", body: JSON.stringify({ shareText: share }) }).then(() => api<{ videos: VideoRow[] }>("/api/admin/videos")).then((res) => { setVideos(res.videos); setShare(""); }).catch((err) => setError(err.message))}>开始下载</button>
-            <p className="muted">下载失败就从相册上传。海外服务器有时下不了抖音。</p>
+            <p className="muted">粘贴整段分享文字或直接粘链接都行，标题和封面会自动带出来。抖音有风控，视频文件下不来时用下面这个上传，或者对失败的条目点「从相册补传视频」。</p>
             <input type="file" accept="video/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file).catch((err) => setError(err.message)); }} />
             {progress && <p className="ok">{progress}</p>}
           </section>
@@ -241,7 +241,7 @@ export function App() {
             const line = progressLine(video);
             return (
             <article className="card" key={video.id}>
-              {video.status === "ready" && <img className="cover" src={`/api/admin/videos/${video.id}/cover`} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }} />}
+              {(video.status === "ready" || video.status === "failed") && <img className="cover" src={`/api/admin/videos/${video.id}/cover`} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }} />}
               <h2>{video.title}</h2>
               <p className="muted">{VIDEO_STATUS[video.status] ?? video.status} · {video.duration_seconds} 秒 {video.published ? "· 已上架" : "· 未上架"}</p>
               {line && (
@@ -251,6 +251,12 @@ export function App() {
                 </>
               )}
               {video.error && <p className="error">{video.error}</p>}
+              {video.status === "failed" && (
+                <label className="ghost" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+                  从相册补传视频
+                  <input type="file" accept="video/*" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file, video.id).catch((err) => setError(err.message)); }} />
+                </label>
+              )}
               {playingId === video.id && <video className="preview" src={`/api/admin/videos/${video.id}/file`} controls playsInline autoPlay />}
               <div className="row">
                 {video.status === "ready" && <button className="primary" onClick={() => setPlayingId(playingId === video.id ? null : video.id)}>{playingId === video.id ? "收起" : "播放"}</button>}
