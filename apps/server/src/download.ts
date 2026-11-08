@@ -544,10 +544,13 @@ async function downloadOne(service: Service, videoId: number, url: string, dataD
       errors.push(`${name}：${message.includes("ENOENT") ? "服务器上没有安装" : message.split("\n")[0].slice(0, 120)}`);
       continue;
     }
+    // 通道只留一条日志：下次出问题能立刻看出是浏览器成的还是 yt-dlp 成的
+    console.log(`[下载] 视频 ${videoId} 经「${name}」通道拿到文件`);
     await finalizeVideo(service, videoId, out);
     return;
   }
   clearJob(videoId);
+  console.log(`[下载] 视频 ${videoId} 全部通道失败：${errors.join("；")}`);
   const hint = seo?.title
     ? "标题和封面已经自动填好，视频文件请用手机「分享 → 保存到相册」后从相册上传。"
     : "没能自动下载这个视频，请用手机把它保存到相册后从相册上传。";
